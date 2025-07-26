@@ -1,9 +1,9 @@
+# backend/api/routes.py
 from fastapi import APIRouter
 from api.chat import router as chat_router
 
 router = APIRouter()
 
-# Include the chat router
 router.include_router(chat_router)
 
 @router.get("/ping")

@@ -1,65 +1,54 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from uuid import uuid4
-from datetime import datetime
-
-from db.database import database
-from db.models import Session, Message
-
-from sqlalchemy import insert, select
+from sqlalchemy.orm import Session
+from db.database import get_db
+from db import models
+from api.llm import ask_groq_llm
 
 router = APIRouter()
 
 class ChatRequest(BaseModel):
+    user_id: int
     message: str
-    conversation_id: int | None = None  # Now this is session_id
+    session_id: int | None = None
 
-class ChatResponse(BaseModel):
-    conversation_id: int
-    user_message: str
-    ai_response: str
-    timestamp: datetime
-
-@router.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(payload: ChatRequest):
-    now = datetime.utcnow()
-
-    # Check if session exists or create a new one
-    if payload.conversation_id is None:
-        # Create new session
-        query = insert(Session).values(created_at=now)
-        session_id = await database.execute(query)
+@router.post("/chat")
+def chat_endpoint(req: ChatRequest, db: Session = Depends(get_db)):
+    # Session logic
+    if req.session_id:
+        session = db.query(models.Session).filter(models.Session.id == req.session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
     else:
-        # Check if session exists
-        query = select(Session).where(Session.id == payload.conversation_id)
-        session = await database.fetch_one(query)
-        if session is None:
-            raise HTTPException(status_code=404, detail="Conversation ID not found.")
-        session_id = payload.conversation_id
+        session = models.Session(user_id=req.user_id)
+        db.add(session)
+        db.commit()
+        db.refresh(session)
 
-    user_message = payload.message
-    ai_response = f"Echo: {user_message}"
+    # Save user message
+    user_message = models.Message(sender="user", message=req.message, session_id=session.id)
+    db.add(user_message)
+    db.commit()
+    db.refresh(user_message)
 
-    # Insert both user and AI messages
-    insert_query = insert(Message)
-    await database.execute_many(query=insert_query, values=[
-        {
-            "session_id": session_id,
-            "sender": "user",
-            "message": user_message,
-            "timestamp": now
-        },
-        {
-            "session_id": session_id,
-            "sender": "ai",
-            "message": ai_response,
-            "timestamp": now
-        }
-    ])
+    # Get AI response
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant for a shopping website."},
+        {"role": "user", "content": req.message}
+    ]
 
-    return ChatResponse(
-        conversation_id=session_id,
-        user_message=user_message,
-        ai_response=ai_response,
-        timestamp=now
-    )
+    try:
+        ai_response = ask_groq_llm(messages)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Save AI message
+    ai_message = models.Message(sender="ai", message=ai_response, session_id=session.id)
+    db.add(ai_message)
+    db.commit()
+
+    return {
+        "session_id": session.id,
+        "user_message": req.message,
+        "ai_response": ai_response
+    }
